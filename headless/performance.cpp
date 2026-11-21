@@ -580,25 +580,46 @@ static void RefreshFreeMemory() {
     largest_free_block.store(known ? (view.free != 0 ? view.free : 1) : 0, std::memory_order_relaxed);
     graphics_memory_short.store(view.short_memory, std::memory_order_relaxed);
     // The pool, the guest's memory and the heap in stderr.log every 20 s, to see what holds it.
+    // Written on a thread of its own (MemorySummary), not here: this runs on the GPU thread, inside
+    // the buffer cache's TickFrame with the rasterizer's lock held, and on firmware 13.60 the
+    // summary's calls into the system libraries have been seen to block for good. Blocked here,
+    // the GPU thread held the lock every guest write waits for and the game froze; blocked on its
+    // own thread, the summary only stops being written.
     static std::atomic<long long> summary_ns{0};
-    if (now - summary_ns.load(std::memory_order_relaxed) >= 10'000'000'000) {
+    static std::atomic<std::size_t> summary_largest{0};
+    static std::atomic<bool> summary_short{false}, summary_due{false};
+    static std::once_flag summary_started;
+    if (now - summary_ns.load(std::memory_order_relaxed) >= 20'000'000'000) {
         summary_ns.store(now, std::memory_order_relaxed);
-        std::size_t guest_span = 0, guest_held = 0;
-        ::Common::GuestMemoryUsage(&guest_span, &guest_held);
-        const auto kernel_memory = guest_kernel_memory.load(std::memory_order_relaxed);
-        std::fprintf(stderr, "EDEN_MEMORY pool largest free block %zu MiB, short=%d; the guest's memory holds %zu MiB"
-                     " (the kernel maps %llu MiB)\n",
-                     largest >> 20, int(view.short_memory), guest_held >> 20,
-                     kernel_memory ? kernel_memory() >> 20 : 0ULL);
-        std::fprintf(stderr, "EDEN_MEMORY_PARTS t=%lld driver_mib=%llu guest_held_mib=%zu guest_span_mib=%zu\n",
-                     now / 1'000'000'000,
-                     &eden_radv_private_radv_ps5_allocated_bytes != nullptr
-                         ? __atomic_load_n(&eden_radv_private_radv_ps5_allocated_bytes, __ATOMIC_RELAXED) >> 20 : 0ULL,
-                     guest_held >> 20, guest_span >> 20);
-        ReportHeap("every 20 s");
-        ReportFileHandles();
-        ::Kernel::Svc::MemoryStats::Report(stderr);
-        if (const auto pools = guest_pool_report.load(std::memory_order_relaxed)) pools();
+        summary_largest.store(largest, std::memory_order_relaxed);
+        summary_short.store(view.short_memory, std::memory_order_relaxed);
+        summary_due.store(true, std::memory_order_release);
+        std::call_once(summary_started, [now] {
+            std::thread([now] {
+                for (;;) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(250));
+                    if (!summary_due.exchange(false, std::memory_order_acq_rel)) continue;
+                    std::size_t guest_span = 0, guest_held = 0;
+                    ::Common::GuestMemoryUsage(&guest_span, &guest_held);
+                    const auto kernel_memory = guest_kernel_memory.load(std::memory_order_relaxed);
+                    const std::size_t l = summary_largest.load(std::memory_order_relaxed);
+                    const bool sh = summary_short.load(std::memory_order_relaxed);
+                    std::fprintf(stderr, "EDEN_MEMORY pool largest free block %zu MiB, short=%d; the guest's memory holds %zu MiB"
+                                 " (the kernel maps %llu MiB)\n",
+                                 l >> 20, int(sh), guest_held >> 20,
+                                 kernel_memory ? kernel_memory() >> 20 : 0ULL);
+                    std::fprintf(stderr, "EDEN_MEMORY_PARTS t=%lld driver_mib=%llu guest_held_mib=%zu guest_span_mib=%zu\n",
+                                 now / 1'000'000'000,
+                                 &eden_radv_private_radv_ps5_allocated_bytes != nullptr
+                                     ? __atomic_load_n(&eden_radv_private_radv_ps5_allocated_bytes, __ATOMIC_RELAXED) >> 20 : 0ULL,
+                                 guest_held >> 20, guest_span >> 20);
+                    ReportHeap("every 20 s");
+                    ReportFileHandles();
+                    ::Kernel::Svc::MemoryStats::Report(stderr);
+                    if (const auto pools = guest_pool_report.load(std::memory_order_relaxed)) pools();
+                }
+            }).detach();
+        });
     }
     // The heap's empty spaces go back to the pool while it is short (every 2 s at most).
     static std::atomic<long long> trimmed_ns{0};
